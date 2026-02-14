@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+.env/
+
+# Models (LLM / STT / TTS)
+models/
+*.gguf
+*.onnx
+*.bin
+
+# llama.cpp build
+llama.cpp/
+build/
+
+# Audio / cache
+*.wav
+*.mp3
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
