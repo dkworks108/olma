@@ -22,7 +22,6 @@ def main():
     llm = QwenEngine(
         model_path=QWEN_MODEL,
         llama_bin=LLAMA_BIN,
-        ctx=2048
     )
 
     tts = PiperEngine(
