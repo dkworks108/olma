@@ -29,7 +29,7 @@ def main():
     )
 
     while True:
-        user_text = input("You: ").strip()
+        user_text = input("You : ").strip()
 
         if not user_text:
             continue
