@@ -32,7 +32,7 @@ class QwenEngine:
             "-m", self.model_path,
 
             # 🔑 LIGHTWEIGHT + FAST SETTINGS
-            "--ctx-size", "512",
+            "--ctx-size", "1024",
             "--n-predict", "64",
 
             "--temp", "0.2",
