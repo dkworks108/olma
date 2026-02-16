@@ -19,13 +19,10 @@ def main():
         "models/llama.cpp/build/bin/llama-cli"
     )
 
-    llm = QwenEngine(
-        model_path=QWEN_MODEL,
-        llama_bin=LLAMA_BIN,
-    )
+    llm = QwenEngine()
 
     tts = PiperEngine(
-        "models/piper/hi_IN-priyamvada-medium.onnx"
+         "models/piper/en_US-amy-medium.onnx"
     )
 
     while True:

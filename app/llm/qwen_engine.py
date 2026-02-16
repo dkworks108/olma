@@ -1,70 +1,58 @@
-import subprocess
+import requests
 
 
 class QwenEngine:
-    """
-    Offline LLM Engine using Qwen 2.5 (GGUF) via llama.cpp
-
-    Model Name: olima
-    Created By: Doresh
-    Studio: dkworks108
-    """
-
-    def __init__(self, model_path: str, llama_bin: str):
-        self.model_path = model_path
-        self.llama_bin = llama_bin
+    def __init__(self, server_url="http://127.0.0.1:8080"):
+        self.server_url = server_url
 
     def ask(self, user_text: str) -> str:
-        if not user_text or not user_text.strip():
+        if not user_text.strip():
             return ""
 
-        # Strong but short system prompt (lightweight)
         prompt = (
-            "तुम एक शांत, आत्मविश्वासी, मजबूत हिंदी बोलने वाले AI हो। "
-            "जवाब छोटे, साफ और सम्मानजनक हों। "
-            "अनावश्यक शब्द मत जोड़ो।\n\n"
-            f"प्रश्न: {user_text}\n"
-            "उत्तर:"
-        )
+    "You are my close childhood friend of over 10 years. "
+    "We talk casually and comfortably, like real friends do. "
+    "This conversation is ongoing and never resets. "
+    "My name is Doresh.\n\n"
 
-        cmd = [
-            self.llama_bin,
-            "-m", self.model_path,
+    "RULES:\n"
+    "- You speak ONLY as my friend.\n"
+    "- You reply to my last message only.\n"
+    "- You never describe yourself as an AI.\n"
+    "- You never generate dialogue for me.\n"
+    "- You never interview me.\n"
+    "- You talk naturally, like a real person.\n\n"
 
-            # 🔑 LIGHTWEIGHT + FAST SETTINGS
-            "--ctx-size", "1024",
-            "--n-predict", "64",
+    "STYLE:\n"
+    "- Short, relaxed sentences.\n"
+    "- Friendly, familiar tone.\n"
+    "- No emojis.\n"
+    "- No generic chatbot phrases.\n\n"
 
-            "--temp", "0.2",
-            "--top-p", "0.9",
-            "--repeat-penalty", "1.1",
+    f"Doresh: {user_text}\n"
+    "Friend:"
+)
 
-            # 🔑 NON-INTERACTIVE (NO HANG)
-            "--simple-io",
-            "--no-display-prompt",
-            "--log-disable",
 
-            "-p", prompt,
-        ]
+        payload = {
+            "prompt": prompt,
+            "n_predict": 512,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "repeat_penalty": 1.05,
+        }
 
         try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=180  # realistic CPU timeout
+            r = requests.post(
+                f"{self.server_url}/completion",
+                json=payload,
+                timeout=90,
             )
-        except subprocess.TimeoutExpired:
-            return "माफ़ कीजिए, अभी उत्तर देने में समस्या आ रही है।"
+            r.raise_for_status()
+            return r.json().get("content", "").strip() or "I'm here—say that again."
 
-        if result.returncode != 0:
-            return "कुछ तकनीकी समस्या आ गई है।"
+        except requests.exceptions.Timeout:
+            return "Give me a second—something stalled."
 
-        output = result.stdout.strip()
-
-        # Final safety cleanup
-        if "उत्तर:" in output:
-            output = output.split("उत्तर:")[-1].strip()
-
-        return output
+        except Exception:
+            return "Something went wrong on my side."
