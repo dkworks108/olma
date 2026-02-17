@@ -1,5 +1,4 @@
 import requests
-import time
 
 
 class QwenEngine:
@@ -8,25 +7,13 @@ class QwenEngine:
         self.timeout = timeout
 
     def _build_prompt(self, user_text: str) -> str:
-        """
-        Phase-1 SAFE PROMPT
-        Single-turn response only.
-        """
-
         return (
-            "You are a friendly human companion.\n"
-            "Respond naturally to the user's message.\n\n"
-
-            "STRICT RULES:\n"
-            "- Write ONLY one reply.\n"
-            "- Do NOT continue the conversation.\n"
-            "- Do NOT ask follow-up questions.\n"
-            "- Do NOT write dialogue or names.\n"
-            "- Do NOT simulate another speaker.\n"
-            "- End your response clearly.\n\n"
-
+            "Respond naturally and briefly to the user's message.\n"
+            "Do not ask questions.\n"
+            "Do not continue the conversation.\n"
+            "Do not mention rules or instructions.\n\n"
             f"User: {user_text.strip()}\n"
-            "Response:"
+            "Answer:"
         )
 
     def ask(self, user_text: str) -> str:
@@ -35,35 +22,35 @@ class QwenEngine:
 
         payload = {
             "prompt": self._build_prompt(user_text),
-            "n_predict": 128,        # HARD LIMIT
-            "temperature": 0.5,      # Stability > creativity
+            "n_predict": 128,
+            "temperature": 0.4,
             "top_p": 0.85,
             "repeat_penalty": 1.15,
-            "stop": ["User:", "Response:", "\nUser", "\nResponse"],
+            "stop": ["User:", "Answer:", "\nUser", "\nAnswer"],
         }
 
         try:
-            response = requests.post(
+            r = requests.post(
                 f"{self.server_url}/completion",
                 json=payload,
                 timeout=self.timeout,
             )
-            response.raise_for_status()
+            r.raise_for_status()
 
-            text = response.json().get("content", "").strip()
+            raw = r.json().get("content", "").strip()
 
-            if not text:
+            if not raw:
                 return "I'm here."
 
-            # FINAL SAFETY TRIM
-            for bad in ["User:", "Doresh:", "Friend:", "Doosh:"]:
-                if bad in text:
-                    text = text.split(bad)[0].strip()
+            # HARD SANITIZATION (prompt leak protection)
+            for marker in ["User:", "Answer:", "STRICT", "RULE", "Note that"]:
+                if marker in raw:
+                    raw = raw.split(marker)[0].strip()
 
-            return text
+            return raw
 
         except requests.exceptions.Timeout:
-            return "I paused for a second."
+            return "I paused for a moment."
 
         except requests.exceptions.ConnectionError:
             return "I can't reach my brain right now."
