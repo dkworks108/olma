@@ -1,59 +1,72 @@
 import requests
+import time
 
 
 class QwenEngine:
-    def __init__(self, server_url="http://127.0.0.1:8080"):
+    def __init__(self, server_url="http://127.0.0.1:8080", timeout=60):
         self.server_url = server_url
+        self.timeout = timeout
+
+    def _build_prompt(self, user_text: str) -> str:
+        """
+        Phase-1 SAFE PROMPT
+        Single-turn response only.
+        """
+
+        return (
+            "You are a friendly human companion.\n"
+            "Respond naturally to the user's message.\n\n"
+
+            "STRICT RULES:\n"
+            "- Write ONLY one reply.\n"
+            "- Do NOT continue the conversation.\n"
+            "- Do NOT ask follow-up questions.\n"
+            "- Do NOT write dialogue or names.\n"
+            "- Do NOT simulate another speaker.\n"
+            "- End your response clearly.\n\n"
+
+            f"User: {user_text.strip()}\n"
+            "Response:"
+        )
 
     def ask(self, user_text: str) -> str:
-        if not user_text.strip():
+        if not user_text or not user_text.strip():
             return ""
 
-        prompt = (
-    "You are my close childhood friend of over 10 years. "
-    "We talk casually and comfortably, like real friends do. "
-    "This conversation is ongoing and never resets. "
-    "My name is Doresh.\n\n"
-
-    "RULES:\n"
-    "- You speak ONLY as my friend.\n"
-    "- You reply to my last message only.\n"
-    "- You never describe yourself as an AI.\n"
-    
-    "- You never generate dialogue for me.\n"
-    "- You never interview me.\n"
-    "- You talk naturally, like a real person.\n\n"
-
-    "STYLE:\n"
-    "- Short, relaxed sentences.\n"
-    "- Friendly, familiar tone.\n"
-    "- No emojis.\n"
-    "- No generic chatbot phrases.\n\n"
-
-    f"Doresh: {user_text}\n"
-    "Friend:"
-)
-
-
         payload = {
-            "prompt": prompt,
-            "n_predict": 512,
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "repeat_penalty": 1.05,
+            "prompt": self._build_prompt(user_text),
+            "n_predict": 128,        # HARD LIMIT
+            "temperature": 0.5,      # Stability > creativity
+            "top_p": 0.85,
+            "repeat_penalty": 1.15,
+            "stop": ["User:", "Response:", "\nUser", "\nResponse"],
         }
 
         try:
-            r = requests.post(
+            response = requests.post(
                 f"{self.server_url}/completion",
                 json=payload,
-                timeout=90,
+                timeout=self.timeout,
             )
-            r.raise_for_status()
-            return r.json().get("content", "").strip() or "I'm here—say that again."
+            response.raise_for_status()
+
+            text = response.json().get("content", "").strip()
+
+            if not text:
+                return "I'm here."
+
+            # FINAL SAFETY TRIM
+            for bad in ["User:", "Doresh:", "Friend:", "Doosh:"]:
+                if bad in text:
+                    text = text.split(bad)[0].strip()
+
+            return text
 
         except requests.exceptions.Timeout:
-            return "Give me a second—something stalled."
+            return "I paused for a second."
+
+        except requests.exceptions.ConnectionError:
+            return "I can't reach my brain right now."
 
         except Exception:
-            return "Something went wrong on my side."
+            return "Something went wrong."

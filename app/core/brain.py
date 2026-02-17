@@ -6,29 +6,32 @@ class Brain:
     def process(self, text: str) -> dict:
         intent = self.intent_engine.detect_intent(text)
 
+        # SYSTEM COMMAND (Phase-1 English only)
         if intent["intent"] == "SYSTEM":
             return {
                 "type": "SYSTEM",
-                "reply": "सिस्टम बंद किया जा रहा है।"
+                "reply": "Shutting down the system."
             }
 
+        # ACTION COMMANDS (future hardware layer)
         if intent["intent"] == "COMMAND":
             action = intent.get("action", "UNKNOWN")
 
             reply_map = {
-                "MOVE_FORWARD": "आदेश समझ लिया। आगे बढ़ रहा हूँ।",
-                "MOVE_BACKWARD": "ठीक है, पीछे जा रहा हूँ।",
-                "TURN_LEFT": "बाईं ओर मुड़ रहा हूँ।",
-                "TURN_RIGHT": "दाईं ओर मुड़ रहा हूँ।",
-                "STOP": "रुक गया हूँ।"
+                "MOVE_FORWARD": "Moving forward.",
+                "MOVE_BACKWARD": "Moving backward.",
+                "TURN_LEFT": "Turning left.",
+                "TURN_RIGHT": "Turning right.",
+                "STOP": "Stopped."
             }
 
             return {
                 "type": "ACTION",
                 "action": action,
-                "reply": reply_map.get(action, "आदेश समझ लिया।")
+                "reply": reply_map.get(action, "Command received.")
             }
 
+        # NORMAL SPEECH
         reply = self.llm_engine.ask(text)
 
         return {
