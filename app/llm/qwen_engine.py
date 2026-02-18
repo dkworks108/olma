@@ -1,4 +1,5 @@
 import requests
+import re
 
 
 class QwenEngine:
@@ -6,27 +7,56 @@ class QwenEngine:
         self.server_url = server_url
         self.timeout = timeout
 
+    def _analyze_input(self, text: str) -> dict:
+        words = text.split()
+        length = len(text)
+        word_count = len(words)
+
+        return {
+            "has_question": "?" in text,
+            "has_numbers": bool(re.search(r"\d", text)),
+            "word_count": word_count,
+            "char_count": length,
+            "short": word_count <= 3,
+            "very_short": word_count <= 1,
+        }
+
     def _build_prompt(self, user_text: str) -> str:
         return (
-            "Respond naturally and briefly to the user's message.\n"
-            "Do not ask questions.\n"
-            "Do not continue the conversation.\n"
-            "Do not mention rules or instructions.\n\n"
-            f"User: {user_text.strip()}\n"
-            "Answer:"
+            "Give a clear, useful answer.\n"
+            "Be concise.\n"
+            "Do not add explanations or commentary.\n\n"
+            f"Input: {user_text.strip()}\n"
+            "Output:"
         )
 
     def ask(self, user_text: str) -> str:
         if not user_text or not user_text.strip():
             return ""
 
+        signals = self._analyze_input(user_text)
+
+        n_predict = min(
+            32 + signals["word_count"] * 8,
+            128
+        )
+
+        if signals["has_numbers"]:
+            temperature = 0.1
+        elif signals["short"]:
+            temperature = 0.2
+        else:
+            temperature = 0.3
+
+        top_p = 0.85
+
         payload = {
             "prompt": self._build_prompt(user_text),
-            "n_predict": 128,
-            "temperature": 0.4,
-            "top_p": 0.85,
-            "repeat_penalty": 1.15,
-            "stop": ["User:", "Answer:", "\nUser", "\nAnswer"],
+            "n_predict": n_predict,
+            "temperature": temperature,
+            "top_p": top_p,
+            "repeat_penalty": 1.2,
+            "stop": ["Input:", "Output:", "\nInput", "\nOutput"],
         }
 
         try:
@@ -38,22 +68,27 @@ class QwenEngine:
             r.raise_for_status()
 
             raw = r.json().get("content", "").strip()
-
             if not raw:
-                return "I'm here."
+                return "Okay."
 
-            # HARD SANITIZATION (prompt leak protection)
-            for marker in ["User:", "Answer:", "STRICT", "RULE", "Note that"]:
-                if marker in raw:
-                    raw = raw.split(marker)[0].strip()
+            raw = raw.split("\n")[0]
+            raw = re.sub(r"[^\w\s.,?!]", "", raw)
 
-            return raw
+            for end in [".", "?", "!"]:
+                if end in raw:
+                    raw = raw.split(end)[0] + end
+                    break
+
+            if len(raw) > 140:
+                raw = raw[:140].rsplit(" ", 1)[0]
+
+            return raw.strip()
 
         except requests.exceptions.Timeout:
-            return "I paused for a moment."
+            return "One moment."
 
         except requests.exceptions.ConnectionError:
-            return "I can't reach my brain right now."
+            return "I can't reach the model."
 
         except Exception:
             return "Something went wrong."
