@@ -1,9 +1,23 @@
-import re
-import time
+# qwen_engine.py
+# Advanced, production-grade "dumb transport" LLM engine for llama.cpp /completion
+# - Accepts context=... (ignored) to match Brain contract
+# - NEVER injects objects, roles, or system prompts
+# - Optional safe_context_text (string only) if Brain explicitly provides it
+# - Robust retries (exp backoff + jitter), session reuse, circuit breaker
+# - Deterministic prompt truncation, clean error types
+# - Works smoothly with Brain.ask(text, context=MemoryContext)
+
+from __future__ import annotations
+
+import json
 import logging
+import random
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional
+
 import requests
-from dataclasses import dataclass, field
-from typing import Optional, Any
+
 
 logger = logging.getLogger("QwenEngine")
 logging.basicConfig(
@@ -12,330 +26,387 @@ logging.basicConfig(
 )
 
 
-@dataclass
-class Message:
-    role: str
-    content: str
+# -----------------------------
+# Config + Errors
+# -----------------------------
 
-
-@dataclass
+@dataclass(frozen=True)
 class GenerationConfig:
     n_predict: int = 256
     temperature: float = 0.3
-    top_p: float = 0.90
+    top_p: float = 0.9
     top_k: int = 40
     repeat_penalty: float = 1.15
-    stop: list = field(default_factory=lambda: [
-        "User:", "Assistant:", "\nUser", "\nAssistant"
-    ])
+    stop: Optional[list[str]] = None
 
 
-def _analyze(text: str) -> dict:
-    words = text.split()
-    return {
-        "word_count": len(words),
-        "char_count": len(text),
-        "has_question": text.strip().endswith("?") or text.lower().startswith(
-            ("what", "who", "where", "when", "why", "how", "is ", "are ", "can ", "does ")
-        ),
-        "has_numbers": bool(re.search(r"\d", text)),
-        "is_code_request": any(
-            kw in text.lower()
-            for kw in ["code", "function", "script", "write", "implement", "debug", "class", "def ", "import"]
-        ),
-        "is_math": bool(re.search(r"[\d\+\-\*/=\^%]", text)) and len(words) <= 12,
-        "is_short": len(words) <= 5,
-        "is_very_short": len(words) <= 2,
-    }
+class LLMError(RuntimeError):
+    """Base class for LLM engine errors."""
 
 
-def _build_config(signals: dict) -> GenerationConfig:
-    cfg = GenerationConfig()
-
-    if signals["is_code_request"]:
-        cfg.n_predict = 512
-    elif signals["is_short"] or signals["is_math"]:
-        cfg.n_predict = 128
-    else:
-        cfg.n_predict = min(64 + signals["word_count"] * 12, 384)
-
-    if signals["is_math"] or signals["has_numbers"]:
-        cfg.temperature = 0.05
-    elif signals["is_code_request"]:
-        cfg.temperature = 0.15
-    elif signals["is_short"]:
-        cfg.temperature = 0.25
-    else:
-        cfg.temperature = 0.35
-
-    if signals["is_code_request"]:
-        cfg.top_p = 0.95
-        cfg.top_k = 50
-    elif signals["is_math"]:
-        cfg.top_p = 0.80
-        cfg.top_k = 20
-    else:
-        cfg.top_p = 0.90
-        cfg.top_k = 40
-
-    return cfg
+class LLMTimeoutError(LLMError):
+    pass
 
 
-SYSTEM_PROMPT = (
-    "You are a concise, accurate assistant. "
-    "Answer directly without unnecessary preamble. "
-    "For code, output only the code block. "
-    "For math, show the answer and a brief explanation."
-)
+class LLMConnectionError(LLMError):
+    pass
 
 
-def _context_to_text(context: Any) -> str:
-    """
-    Convert arbitrary MemoryContext-like objects into a safe text block.
-    This is intentionally defensive: it won't crash if context is a custom class.
-    """
-    if context is None:
-        return ""
-
-    # Common patterns: context might already be a string
-    if isinstance(context, str):
-        return context.strip()
-
-    # dict-like memory
-    if isinstance(context, dict):
-        parts = []
-        for k, v in context.items():
-            if v is None:
-                continue
-            parts.append(f"{k}: {v}")
-        return "\n".join(parts).strip()
-
-    # Object with nice helpers
-    for attr in ("to_prompt", "to_text", "render", "as_prompt", "as_text"):
-        fn = getattr(context, attr, None)
-        if callable(fn):
-            try:
-                out = fn()
-                if isinstance(out, str) and out.strip():
-                    return out.strip()
-            except Exception:
-                pass
-
-    # Fallback: repr
-    try:
-        return str(context).strip()
-    except Exception:
-        return ""
+class LLMHTTPError(LLMError):
+    pass
 
 
-def _build_messages_prompt(history: list[Message], user_text: str, context: Any = None) -> str:
-    lines = [f"System: {SYSTEM_PROMPT}\n"]
-
-    ctx_text = _context_to_text(context)
-    if ctx_text:
-        lines.append("Context:")
-        lines.append(ctx_text)
-        lines.append("")  # blank line to separate
-
-    for msg in history:
-        role = "User" if msg.role == "user" else "Assistant"
-        lines.append(f"{role}: {msg.content}")
-
-    lines.append(f"User: {user_text.strip()}")
-    lines.append("Assistant:")
-    return "\n".join(lines)
+class LLMCircuitOpenError(LLMError):
+    pass
 
 
-def _clean(raw: str, signals: dict) -> str:
-    if not raw:
-        return "Okay."
-
-    for marker in ("Assistant:", "User:", "Output:", "Input:"):
-        if marker in raw:
-            raw = raw.split(marker)[-1]
-
-    raw = raw.strip()
-
-    if signals.get("is_code_request"):
-        return raw[:2000].strip()
-
-    raw = raw.strip('"\'')
-
-    raw = re.sub(r"\n{3,}", "\n\n", raw)
-
-    max_chars = 600
-    if len(raw) > max_chars:
-        cut = raw[:max_chars]
-        for end in (".", "?", "!"):
-            idx = cut.rfind(end)
-            if idx > max_chars // 2:
-                raw = cut[: idx + 1]
-                break
-        else:
-            raw = cut.rsplit(" ", 1)[0] + "…"
-
-    return raw.strip()
-
+# -----------------------------
+# Engine
+# -----------------------------
 
 class QwenEngine:
+    """
+    Pure text completion engine.
+    - It is NOT a chatbot.
+    - It does NOT manage history.
+    - It does NOT add System/User/Assistant roles.
+    - It does NOT inspect or stringify context objects.
+
+    Expected usage from Brain:
+        engine.ask(text, context=memory_ctx)
+
+    Optional safe injection:
+        engine.ask(prompt, safe_context_text=rendered_context)
+    """
+
     def __init__(
         self,
         server_url: str = "http://127.0.0.1:8080",
-        timeout: int = 60,
-        max_history: int = 10,
+        timeout: float = 60.0,
+        max_prompt_chars: int = 24_000,
         debug: bool = False,
+        # circuit breaker
+        breaker_fail_threshold: int = 5,
+        breaker_cooldown_sec: int = 20,
+        # retry/backoff
+        base_backoff_sec: float = 0.7,
+        max_backoff_sec: float = 6.0,
+        jitter_sec: float = 0.25,
+        # transport
+        endpoint: str = "/completion",
+        user_agent: str = "QwenEngine/2.0",
     ):
         self.server_url = server_url.rstrip("/")
-        self.timeout = timeout
-        self.max_history = max_history
-        self.history: list[Message] = []
+        self.timeout = float(timeout)
+        self.max_prompt_chars = int(max_prompt_chars)
+
+        self.endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": user_agent})
+
+        # breaker state
+        self._fail_count = 0
+        self._breaker_open_until = 0.0
+        self._breaker_fail_threshold = int(breaker_fail_threshold)
+        self._breaker_cooldown_sec = float(breaker_cooldown_sec)
+
+        # retry/backoff tuning
+        self._base_backoff_sec = float(base_backoff_sec)
+        self._max_backoff_sec = float(max_backoff_sec)
+        self._jitter_sec = float(jitter_sec)
 
         if debug:
             logger.setLevel(logging.DEBUG)
 
+    # -----------------------------
+    # Public API
+    # -----------------------------
+
     def ask(
         self,
-        user_text: str,
+        text: str,
+        context: Optional[Any] = None,  # accepted, intentionally ignored
         *,
-        context: Any = None,  # ✅ NEW: matches Brain–LLM contract
-        stream: bool = False,
+        safe_context_text: Optional[str] = None,
+        cfg: Optional[GenerationConfig] = None,
         retries: int = 2,
-        override_config: Optional[GenerationConfig] = None,
-        **_ignored_kwargs,  # ✅ extra forward-compat safety
+        stream: bool = False,
+        request_meta: Optional[Dict[str, Any]] = None,  # logging only
+        **_ignored_kwargs,  # forward-compat so new Brain args won't crash engine
     ) -> str:
-        user_text = user_text.strip()
-        if not user_text:
+        prompt = (text or "").strip()
+        if not prompt:
             return ""
 
-        signals = _analyze(user_text)
-        cfg = override_config or _build_config(signals)
+        # Circuit breaker: fail fast if server is in a bad state
+        now = time.time()
+        if now < self._breaker_open_until:
+            raise LLMCircuitOpenError("Circuit breaker open: server recently failing.")
 
-        # ✅ include context in prompt (safe even if context is an object)
-        prompt = _build_messages_prompt(self.history, user_text, context=context)
+        if safe_context_text:
+            safe_context_text = safe_context_text.strip()
+            if safe_context_text:
+                # IMPORTANT: safe_context_text must be plain text rendered by Brain.
+                prompt = f"{safe_context_text}\n\n{prompt}"
 
-        logger.debug("Prompt:\n%s", prompt)
-        logger.debug("Config: %s", cfg)
+        prompt = self._truncate_prompt(prompt)
 
-        raw = self._call_with_retry(prompt, cfg, stream=stream, retries=retries)
-        response = _clean(raw, signals)
+        cfg = cfg or GenerationConfig()
 
-        self._add_to_history(Message("user", user_text))
-        self._add_to_history(Message("assistant", response))
+        if stream:
+            return self._stream_completion(prompt, cfg, retries=retries, request_meta=request_meta)
+        return self._completion(prompt, cfg, retries=retries, request_meta=request_meta)
 
-        return response
+    def healthcheck(self) -> bool:
+        """
+        Best-effort quick check that server is reachable.
+        Returns True/False. Does not raise.
+        """
+        try:
+            _ = self._session.get(self.server_url, timeout=min(3.0, self.timeout))
+            return True
+        except Exception:
+            return False
 
-    def clear_history(self):
-        self.history.clear()
-        logger.debug("History cleared.")
+    # -----------------------------
+    # Internals: completion calls
+    # -----------------------------
 
-    def show_history(self) -> str:
-        if not self.history:
-            return "(No history)"
-        return "\n".join(
-            f"[{m.role.upper()}] {m.content}" for m in self.history
-        )
-
-    def _add_to_history(self, msg: Message):
-        self.history.append(msg)
-        if len(self.history) > self.max_history * 2:
-            self.history = self.history[-(self.max_history * 2):]
-
-    def _call_with_retry(
+    def _completion(
         self,
         prompt: str,
         cfg: GenerationConfig,
-        stream: bool,
+        *,
         retries: int,
+        request_meta: Optional[Dict[str, Any]],
     ) -> str:
-        last_error = None
+        payload = self._build_payload(prompt, cfg, stream=False)
+
+        last_exc: Optional[Exception] = None
         for attempt in range(retries + 1):
             try:
-                if stream:
-                    return self._stream_completion(prompt, cfg)
-                else:
-                    return self._completion(prompt, cfg)
-            except requests.exceptions.Timeout:
-                last_error = "timeout"
-                logger.warning("Attempt %d timed out.", attempt + 1)
-            except requests.exceptions.ConnectionError:
-                last_error = "connection"
-                logger.warning("Attempt %d: connection error.", attempt + 1)
-            except requests.exceptions.HTTPError:
-                return "The model returned an error."
-            except Exception:
-                return "Something went wrong."
+                logger.debug("LLM request meta=%s", request_meta)
+                r = self._session.post(
+                    f"{self.server_url}{self.endpoint}",
+                    json=payload,
+                    timeout=self.timeout,
+                )
 
-            if attempt < retries:
-                time.sleep(2 ** attempt)
+                # Treat 5xx as transient, 4xx as permanent (usually bad payload)
+                if 500 <= r.status_code <= 599:
+                    raise LLMHTTPError(f"Server error {r.status_code}")
+                if 400 <= r.status_code <= 499:
+                    # Permanent: don't retry much, but allow one retry if asked
+                    r.raise_for_status()
 
-        if last_error == "timeout":
-            return "The model is taking too long. Try a shorter prompt."
-        return "I can't reach the model. Is the server running?"
+                r.raise_for_status()
 
-    def _completion(self, prompt: str, cfg: GenerationConfig) -> str:
-        payload = {
-            "prompt": prompt,
-            "n_predict": cfg.n_predict,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "top_k": cfg.top_k,
-            "repeat_penalty": cfg.repeat_penalty,
-            "stop": cfg.stop,
-            "stream": False,
-        }
-        r = requests.post(
-            f"{self.server_url}/completion",
-            json=payload,
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        return r.json().get("content", "").strip()
+                data = self._safe_json(r)
+                text_out = (data.get("content") or "").strip()
 
-    def _stream_completion(self, prompt: str, cfg: GenerationConfig) -> str:
-        payload = {
-            "prompt": prompt,
-            "n_predict": cfg.n_predict,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "top_k": cfg.top_k,
-            "repeat_penalty": cfg.repeat_penalty,
-            "stop": cfg.stop,
-            "stream": True,
-        }
-        collected = []
-        with requests.post(
-            f"{self.server_url}/completion",
-            json=payload,
-            timeout=self.timeout,
-            stream=True,
-        ) as r:
-            r.raise_for_status()
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                line = line.decode("utf-8")
-                if line.startswith("data:"):
-                    import json
-                    try:
-                        chunk = json.loads(line[5:].strip())
+                self._mark_success()
+                return text_out
+
+            except requests.exceptions.Timeout as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMTimeoutError("LLM request timed out.") from e
+
+            except requests.exceptions.ConnectionError as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMConnectionError("LLM connection failed.") from e
+
+            except requests.exceptions.HTTPError as e:
+                # 4xx tends to be permanent, but keep one retry path if configured
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMHTTPError(f"HTTP error: {e}") from e
+
+            except LLMHTTPError as e:
+                # Transient 5xx path
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise
+
+            except Exception as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMError(f"Unexpected LLM error: {e}") from e
+
+            self._sleep_backoff(attempt)
+
+        raise LLMError(f"LLM request failed: {last_exc}")
+
+    def _stream_completion(
+        self,
+        prompt: str,
+        cfg: GenerationConfig,
+        *,
+        retries: int,
+        request_meta: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Streaming parser for llama.cpp SSE-style "data: {json}" lines.
+        If your server streams differently, adjust parse logic.
+        """
+        payload = self._build_payload(prompt, cfg, stream=True)
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            collected: list[str] = []
+            try:
+                logger.debug("LLM stream request meta=%s", request_meta)
+                with self._session.post(
+                    f"{self.server_url}{self.endpoint}",
+                    json=payload,
+                    timeout=self.timeout,
+                    stream=True,
+                ) as r:
+                    if 500 <= r.status_code <= 599:
+                        raise LLMHTTPError(f"Server error {r.status_code}")
+                    r.raise_for_status()
+
+                    for line in self._iter_sse_lines(r.iter_lines()):
+                        # Expect {"content": "...", "stop": bool} chunks
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
                         token = chunk.get("content", "")
-                        print(token, end="", flush=True)
-                        collected.append(token)
+                        if token:
+                            collected.append(token)
+
                         if chunk.get("stop"):
                             break
-                    except json.JSONDecodeError:
-                        continue
-        print()
-        return "".join(collected).strip()
+
+                text_out = "".join(collected).strip()
+                self._mark_success()
+                return text_out
+
+            except requests.exceptions.Timeout as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMTimeoutError("LLM stream timed out.") from e
+
+            except requests.exceptions.ConnectionError as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMConnectionError("LLM stream connection failed.") from e
+
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMHTTPError(f"HTTP error: {e}") from e
+
+            except LLMHTTPError as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise
+
+            except Exception as e:
+                last_exc = e
+                self._mark_failure()
+                if attempt >= retries:
+                    raise LLMError(f"Unexpected LLM stream error: {e}") from e
+
+            self._sleep_backoff(attempt)
+
+        raise LLMError(f"LLM stream request failed: {last_exc}")
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+
+    def _build_payload(self, prompt: str, cfg: GenerationConfig, *, stream: bool) -> Dict[str, Any]:
+        return {
+            "prompt": prompt,
+            "n_predict": int(cfg.n_predict),
+            "temperature": float(cfg.temperature),
+            "top_p": float(cfg.top_p),
+            "top_k": int(cfg.top_k),
+            "repeat_penalty": float(cfg.repeat_penalty),
+            "stop": cfg.stop or [],
+            "stream": bool(stream),
+        }
+
+    def _truncate_prompt(self, prompt: str) -> str:
+        if len(prompt) <= self.max_prompt_chars:
+            return prompt
+        # Deterministic truncation: keep end, where the actual user request usually is.
+        return prompt[-self.max_prompt_chars :]
+
+    def _safe_json(self, response: requests.Response) -> Dict[str, Any]:
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                return data
+            return {"content": str(data)}
+        except Exception:
+            # fallback: treat raw as content
+            return {"content": (response.text or "")}
+
+    def _iter_sse_lines(self, lines: Iterable[bytes]) -> Iterable[str]:
+        """
+        Converts iter_lines() output into JSON strings by stripping "data:" prefixes.
+        Supports both bytes and str lines.
+        """
+        for raw in lines:
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                line = raw.decode("utf-8", errors="ignore").strip()
+            else:
+                line = str(raw).strip()
+
+            # Common SSE: "data: {...}"
+            if line.startswith("data:"):
+                line = line[5:].strip()
+
+            # ignore keepalive / empty
+            if not line or line == "[DONE]":
+                continue
+
+            yield line
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        # exponential backoff with jitter, clamped
+        base = self._base_backoff_sec * (2 ** attempt)
+        base = min(base, self._max_backoff_sec)
+        jitter = random.uniform(0.0, self._jitter_sec)
+        time.sleep(base + jitter)
+
+    def _mark_success(self) -> None:
+        self._fail_count = 0
+        self._breaker_open_until = 0.0
+
+    def _mark_failure(self) -> None:
+        self._fail_count += 1
+        if self._fail_count >= self._breaker_fail_threshold:
+            self._breaker_open_until = time.time() + self._breaker_cooldown_sec
+            logger.warning("Circuit breaker opened for %.1fs", self._breaker_cooldown_sec)
 
 
+# Convenience
 def quick_ask(text: str, **kwargs) -> str:
     return QwenEngine(**kwargs).ask(text)
 
 
 if __name__ == "__main__":
     engine = QwenEngine(debug=True)
-    print("QwenEngine ready. Type 'quit' to exit, 'history' to show chat.\n")
+    print("QwenEngine ready. Type 'quit' to exit.\n")
+
     while True:
         try:
             user_input = input("You: ").strip()
@@ -347,13 +418,13 @@ if __name__ == "__main__":
             continue
         if user_input.lower() in ("quit", "exit"):
             break
-        if user_input.lower() == "history":
-            print(engine.show_history())
-            continue
-        if user_input.lower() == "clear":
-            engine.clear_history()
-            print("History cleared.")
-            continue
 
-        response = engine.ask(user_input)
-        print(f"Assistant: {response}\n")
+        try:
+            out = engine.ask(user_input)
+            print(f"AI: {out}\n")
+        except LLMCircuitOpenError as e:
+            print(f"AI: (server busy) {e}\n")
+        except LLMTimeoutError:
+            print("AI: (timeout) Try a shorter prompt.\n")
+        except LLMError as e:
+            print(f"AI: (error) {e}\n")
