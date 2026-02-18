@@ -3,7 +3,7 @@ import time
 import logging
 import requests
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 
 logger = logging.getLogger("QwenEngine")
 logging.basicConfig(
@@ -89,11 +89,58 @@ SYSTEM_PROMPT = (
 )
 
 
-def _build_messages_prompt(history: list[Message], user_text: str) -> str:
+def _context_to_text(context: Any) -> str:
+    """
+    Convert arbitrary MemoryContext-like objects into a safe text block.
+    This is intentionally defensive: it won't crash if context is a custom class.
+    """
+    if context is None:
+        return ""
+
+    # Common patterns: context might already be a string
+    if isinstance(context, str):
+        return context.strip()
+
+    # dict-like memory
+    if isinstance(context, dict):
+        parts = []
+        for k, v in context.items():
+            if v is None:
+                continue
+            parts.append(f"{k}: {v}")
+        return "\n".join(parts).strip()
+
+    # Object with nice helpers
+    for attr in ("to_prompt", "to_text", "render", "as_prompt", "as_text"):
+        fn = getattr(context, attr, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, str) and out.strip():
+                    return out.strip()
+            except Exception:
+                pass
+
+    # Fallback: repr
+    try:
+        return str(context).strip()
+    except Exception:
+        return ""
+
+
+def _build_messages_prompt(history: list[Message], user_text: str, context: Any = None) -> str:
     lines = [f"System: {SYSTEM_PROMPT}\n"]
+
+    ctx_text = _context_to_text(context)
+    if ctx_text:
+        lines.append("Context:")
+        lines.append(ctx_text)
+        lines.append("")  # blank line to separate
+
     for msg in history:
         role = "User" if msg.role == "user" else "Assistant"
         lines.append(f"{role}: {msg.content}")
+
     lines.append(f"User: {user_text.strip()}")
     lines.append("Assistant:")
     return "\n".join(lines)
@@ -150,9 +197,11 @@ class QwenEngine:
         self,
         user_text: str,
         *,
+        context: Any = None,  # ✅ NEW: matches Brain–LLM contract
         stream: bool = False,
         retries: int = 2,
         override_config: Optional[GenerationConfig] = None,
+        **_ignored_kwargs,  # ✅ extra forward-compat safety
     ) -> str:
         user_text = user_text.strip()
         if not user_text:
@@ -160,7 +209,9 @@ class QwenEngine:
 
         signals = _analyze(user_text)
         cfg = override_config or _build_config(signals)
-        prompt = _build_messages_prompt(self.history, user_text)
+
+        # ✅ include context in prompt (safe even if context is an object)
+        prompt = _build_messages_prompt(self.history, user_text, context=context)
 
         logger.debug("Prompt:\n%s", prompt)
         logger.debug("Config: %s", cfg)
