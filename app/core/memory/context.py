@@ -5,10 +5,6 @@ from typing import Optional
 from .store import MemoryStore, MemoryType
 
 
-# ═══════════════════════════════════════════════════════════════════
-# MEMORY CONTEXT  —  read-only view for LLM / handlers
-# ═══════════════════════════════════════════════════════════════════
-
 class MemoryContext:
     """
     Immutable read-only lens over MemoryStore.
