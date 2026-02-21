@@ -289,7 +289,7 @@ class PiperEngine:
         # ── Step 5: Start playback ───────────────────────────────────
         self.stream.start()
 
-        # ── Step 6: Wait for completion ──────────────────────────────
+        
         while not self._done or not self._q.empty():
             time.sleep(0.015)
 
