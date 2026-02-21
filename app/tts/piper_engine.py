@@ -316,10 +316,6 @@ class PiperEngine:
         self._done = True
 
 
-# ---------------------------------------------------------------------------
-# Quick test
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import sys
 
@@ -333,6 +329,7 @@ if __name__ == "__main__":
         "I can answer questions, help with tasks, and much more. "
         "How can I help you today?"
     )
+    
 
     engine = PiperEngine(model)
     print(f"Speaking: {text}\n")
