@@ -273,10 +273,10 @@ class PiperEngine:
             callback=self._callback,
         )
 
-        # ── Step 3: Natural pre-speech pause ────────────────────────
+        
         time.sleep(PRE_SPEECH_MS / 1000)
 
-        # ── Step 4: Fill queue ───────────────────────────────────────
+        
         for audio in audio_plan:
             self._q.put(audio)
 
