@@ -280,10 +280,10 @@ class PiperEngine:
         for audio in audio_plan:
             self._q.put(audio)
 
-        # Trailing silence so last word isn't clipped
+     
         self._q.put(_silence(self.sample_rate, TRAILING_SILENCE_MS))
 
-        # Sentinel
+        
         self._q.put(None)
 
        
