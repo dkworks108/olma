@@ -264,7 +264,7 @@ class PiperEngine:
         if not audio_plan or self.sample_rate is None:
             return
 
-        # ── Step 2: Open stream ONCE with correct sample rate ────────
+        
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
