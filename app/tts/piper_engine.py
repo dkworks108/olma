@@ -286,7 +286,7 @@ class PiperEngine:
         # Sentinel
         self._q.put(None)
 
-        # ── Step 5: Start playback ───────────────────────────────────
+       
         self.stream.start()
 
         
