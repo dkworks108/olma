@@ -9,3 +9,9 @@ Currently, the project is in **Phase 1 of development**.
 
 ## Phase 1 Goal
 The first phase focuses on building a **stable core communication pipeline**.
+Input → AI Processing → Voice Output
+
+### Pipeline
+```
+Text Input → AI Model → Response Generation → Text-to-Speech → Audio Output
+```
