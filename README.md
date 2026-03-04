@@ -5,3 +5,7 @@ This project focuses on building an **autonomous AI system** powered by open-sou
 The long-term goal of this system is to create an **interactive AI assistant capable of reacting to its environment and communicating naturally with humans**.
 
 Currently, the project is in **Phase 1 of development**.
+---
+
+## Phase 1 Goal
+The first phase focuses on building a **stable core communication pipeline**.
